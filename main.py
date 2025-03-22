@@ -19,17 +19,44 @@ def clean_amount(amount_str):
     cleaned = re.sub(r'[^\d.-]', '', amount_str)
     return cleaned
 
-def extract_expenses_from_pdf(pdf_path):
+def extract_expenses_from_pdf(pdf_path, filter_year=None):
+    """
+    Extract expenses from a PDF statement.
+    If filter_year is provided, only include transactions from that year.
+    """
+    filename = os.path.basename(pdf_path)
     expenses = []
     parse = False
     current_year = datetime.now().year
+    statement_date = None
+    statement_year = None
     
     with pdfplumber.open(pdf_path) as pdf:
+        # First, try to find the statement date to determine the year
+        for page in pdf.pages[:1]:  # Only check first page for statement date
+            text = page.extract_text()
+            if text:
+                # Look for statement date patterns
+                date_match = re.search(r'Statement\s+Date:?\s+(\d{1,2}/\d{1,2}/(\d{2,4}))', text, re.IGNORECASE)
+                if date_match:
+                    statement_date = date_match.group(1)
+                    statement_year = int(date_match.group(2))
+                    if statement_year < 100:  # Handle 2-digit year
+                        statement_year += 2000
+        
         for page in pdf.pages:
             text = page.extract_text()
             if text:
                 lines = text.split('\n')
                 for line in lines:
+                    # Try to detect statement period or billing cycle
+                    if not statement_year and ('billing cycle' in line.lower() or 'statement period' in line.lower()):
+                        date_matches = re.findall(r'(\d{1,2}/\d{1,2}/(\d{2,4}))', line)
+                        if len(date_matches) >= 1:
+                            statement_year = int(date_matches[0][1])
+                            if statement_year < 100:  # Handle 2-digit year
+                                statement_year += 2000
+                    
                     # Start parsing when we see the transaction header
                     if not parse and 'Trans Post Reference' in line:
                         parse = True
@@ -60,7 +87,8 @@ def extract_expenses_from_pdf(pdf_path):
                                 expenses.append({
                                     'Date': 'FINANCE', 
                                     'Name': 'PERIODIC FINANCE CHARGE',
-                                    'Amount': amount
+                                    'Amount': amount,
+                                    'Year': statement_year  # Use statement year for finance charges
                                 })
                         except (ValueError, IndexError):
                             continue
@@ -91,6 +119,17 @@ def extract_expenses_from_pdf(pdf_path):
                                 # Get the amount from the last part
                                 amount = clean_amount(parts[-1])
                                 
+                                # Determine transaction year
+                                transaction_year = statement_year
+                                
+                                # Handle December transactions in January statements (previous year)
+                                if statement_year and date.startswith('12/') and '01_' in filename:
+                                    transaction_year = statement_year - 1
+                                    
+                                # For 2025 file, only include transactions from 2024
+                                if filter_year and transaction_year != filter_year:
+                                    continue
+                                
                                 # Only add if we have all required fields and amount is numeric
                                 if date and name and amount and float(amount) != 0:
                                     # Store the current date for potential finance charges
@@ -99,7 +138,8 @@ def extract_expenses_from_pdf(pdf_path):
                                     expenses.append({
                                         'Date': date, 
                                         'Name': name, 
-                                        'Amount': amount
+                                        'Amount': amount,
+                                        'Year': transaction_year
                                     })
                                     
                                     # Update any preceding finance charges with this date
@@ -133,7 +173,12 @@ def extract_expenses_from_directory(directory_path):
         if filename.endswith('.pdf'):
             pdf_path = os.path.join(directory_path, filename)
             try:
-                expenses = extract_expenses_from_pdf(pdf_path)
+                # Apply year filter only for 2025 statements
+                filter_year = None
+                if '2025' in filename:
+                    filter_year = 2024  # Only include 2024 transactions from 2025 statements
+                
+                expenses = extract_expenses_from_pdf(pdf_path, filter_year)
                 all_expenses.extend(expenses)
                 print(f"Processed {filename}: {len(expenses)} transactions extracted")
             except Exception as e:
@@ -146,10 +191,22 @@ def extract_expenses_from_directory(directory_path):
         # Deduplicate entries based on Date, Name, and Amount
         df = df.drop_duplicates(subset=['Date', 'Name', 'Amount'])
         
-        # Sort by date (MM/DD format)
-        df['SortDate'] = pd.to_datetime(df['Date'] + f'/{datetime.now().year}', format='%m/%d/%Y', errors='coerce')
+        # Create sorting date with year if available
+        def create_sort_date(row):
+            year = row.get('Year', datetime.now().year)
+            try:
+                return pd.to_datetime(f"{row['Date']}/{year}", format='%m/%d/%Y', errors='coerce')
+            except:
+                return pd.to_datetime(f"{row['Date']}/{datetime.now().year}", format='%m/%d/%Y', errors='coerce')
+        
+        df['SortDate'] = df.apply(create_sort_date, axis=1)
         df = df.sort_values('SortDate')
-        df = df.drop('SortDate', axis=1)
+        
+        # Remove temporary columns before saving
+        if 'SortDate' in df.columns:
+            df = df.drop('SortDate', axis=1)
+        if 'Year' in df.columns:
+            df = df.drop('Year', axis=1)
         
         return df
     else:
